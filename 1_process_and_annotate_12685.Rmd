@@ -1,0 +1,365 @@
+---
+title: "process_and_annotate_12685"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = "~/Alyssa/CHS_mCA/")
+library(tidyverse)
+library(Seurat)
+library(SingleCellExperiment)
+library(decontX)
+library(org.Hs.eg.db)
+library(DoubletFinder)
+library(HGNChelper)
+library(harmony)
+library(org.Hs.eg.db)
+
+save_plot = function(plot, file, legend = TRUE, width = 4, height = 4, png = FALSE) {
+  if (png) { ggsave(plot = plot, filename =  paste0(file, ".png"), dpi = 600, width = ifelse(legend, width, width - 1.5), height = height, units = 'in') }
+  ggsave(plot = plot, filename =  paste0(file, ".pdf"), dpi = 600, width = ifelse(legend, width, width - 1.5), height = height, units = 'in')
+}
+```
+
+# If version errors occur, remove.packages() all listed below and install in this order.
+```{r}
+BiocManager::install("Matrix")
+install.packages("irlba", type = "source")
+
+remotes::install_version("SeuratObject", "4.1.4", repos = c("https://satijalab.r-universe.dev", getOption("repos")), upgrade = FALSE)
+remotes::install_version("Seurat", "4.4.0", repos = c("https://satijalab.r-universe.dev", getOption("repos")), upgrade = FALSE)
+
+remotes::install_local("input_data/DoubletFinder")
+```
+
+
+# Copy 10X Flex data.
+```{r}
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P1/per_sample_outs/12685-JVA-3/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-3/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P1/per_sample_outs/12685-JVA-4/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-4/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P1/per_sample_outs/12685-JVA-5/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-5/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P1/per_sample_outs/12685-JVA-6/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-6/")
+
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P2/per_sample_outs/12685-JVA-7/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-7/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P2/per_sample_outs/12685-JVA-8/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-8/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P2/per_sample_outs/12685-JVA-9/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-9/")
+system("gsutil -m cp gs://bicklab-main-storage/Data/vantage/12685-JVA/data/Count/12685-JVA-P2/per_sample_outs/12685-JVA-10/count/sample_filtered_feature_bc_matrix.h5 input_data/12685-JVA-10/")
+
+
+```
+
+# Remove ambient RNA with decontX.
+```{r}
+remove_ambient = function(input_h5) {
+  counts = Read10X_h5(input_h5)
+
+  # Create a SingleCellExperiment object and run decontX
+  sce = SingleCellExperiment(list(counts = counts))
+  sce = decontX(sce)
+  
+  # Create a Seurat object from a SCE with decontX results
+  seurat_object = CreateSeuratObject(round(decontXcounts(sce)))
+  return(seurat_object)
+}
+```
+
+# QC to match Tabula Sapiens.
+```{r}
+quality_control = function(seu) {
+  # Filter based on count thresholds.
+  qc_seu = subset(seu, subset = nFeature_RNA >= 200 & nCount_RNA >= 2500)
+  qc_seu = PercentageFeatureSet(object = qc_seu, pattern = "^MT-", col.name = "percent.mt", assay = "RNA")
+
+  # Filtering based on mitochondrial percent was not discussed in the paper. Typically I use a 25% cutoff.
+  qc_seu = subset(qc_seu, subset = percent.mt < 25)
+
+  # Filter out MT reads.
+  mito = rownames(qc_seu)[grepl("^MT-|MRP", rownames(qc_seu))]
+  qc_seu = subset(qc_seu, features = setdiff(rownames(qc_seu), mito))
+  return(qc_seu)
+}
+```
+
+# SCT normalize to prep for DoubletFinder.
+```{r}
+sct_normalize_and_cluster = function(input_object) {
+  normalized_seu = SCTransform(input_object, vars.to.regress = "percent.mt", verbose = FALSE)
+  normalized_seu = RunPCA(normalized_seu)
+  normalized_seu = RunUMAP(normalized_seu, dims = 1:10)
+  normalized_seu = FindNeighbors(normalized_seu)
+  normalized_seu = FindClusters(normalized_seu)
+  return(normalized_seu)
+}
+```
+
+# DoubletFinder for doublet removal.
+```{r}
+run_doublet_finder = function(seurat_object) {
+  PCs = 1:10 # number of PCs to use determined by looking at ElbowPlot(seurat_object)
+  
+  sweep_res_list = paramSweep(seurat_object, PCs = PCs, sct = TRUE)
+  sweep_stats = summarizeSweep(sweep_res_list, GT = FALSE)
+  bcmvn = find.pK(sweep_stats)
+  
+  pK = bcmvn$pK[which.max(bcmvn$BCmetric)]
+  pK = as.numeric(levels(pK))[pK]
+  
+  annotations = seurat_object@meta.data$seurat_clusters
+  homotypic.prop = modelHomotypic(annotations)
+  doublet_rate = (dim(seurat_object)[2]/0.57) * 4.6e-6 # based on info from https://satijalab.org/costpercell/
+  nExp_poi = round(doublet_rate*nrow(seurat_object@meta.data))
+  nExp_poi.adj = round(nExp_poi*(1-homotypic.prop))
+  
+  seurat_object = doubletFinder(seurat_object, PCs = PCs, pN = 0.25, pK = pK, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = TRUE)
+  
+  doublet_finder_name = colnames(seurat_object@meta.data)[str_detect(string = colnames(seurat_object@meta.data), pattern = "DF.classifications*")] 
+  seurat_object[["DoubletFinder"]] = seurat_object[[doublet_finder_name]] # make doublet finder column more identifiable
+  seurat_object[[doublet_finder_name]] = NULL
+  
+  pANN_name = colnames(seurat_object@meta.data)[str_detect(string = colnames(seurat_object@meta.data), pattern = "pANN")] 
+  seurat_object[["pANN"]] = seurat_object[[pANN_name]] # make pANN column more identifiable
+  seurat_object[[pANN_name]] = NULL
+  
+  return(seurat_object)
+}
+```
+
+
+# Prepare data.
+```{r}
+prepare_data = function(input_path, output_path) {
+  deconted = remove_ambient(input_path)
+  qc = quality_control(deconted)
+  normalized = sct_normalize_and_cluster(qc)
+  doublet_labeled = run_doublet_finder(normalized)
+  saveRDS(doublet_labeled, output_path)
+}
+
+```
+
+```{r}
+
+#prepare_data(input_path = "input_data/12685-JVA-3/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_3.rds") # only 17 cells pass QC - fails with normalization
+prepare_data(input_path = "input_data/12685-JVA-4/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_4.rds")
+prepare_data(input_path = "input_data/12685-JVA-5/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_5.rds")
+prepare_data(input_path = "input_data/12685-JVA-6/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_6.rds")
+prepare_data(input_path = "input_data/12685-JVA-7/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_7.rds")
+prepare_data(input_path = "input_data/12685-JVA-8/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_8.rds")
+prepare_data(input_path = "input_data/12685-JVA-9/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_9.rds")
+prepare_data(input_path = "input_data/12685-JVA-10/sample_filtered_feature_bc_matrix.h5", output_path = "rds_objects/12685-JVA/1_doublet_labeled_sample_10.rds")
+
+```
+# Combine all samples
+```{r}
+samples = list.files("rds_objects/12685-JVA", full.names = TRUE)
+seurat_list = list()
+
+for (file in samples) {
+  seurat_obj = readRDS(file)
+  seurat_obj$sample = sub(".*_(\\d+)\\.rds$", "\\1", file)
+  seurat_list[[file]] = seurat_obj
+}
+
+merged_seurat = Reduce(function(x, y) merge(x, y), seurat_list)
+```
+
+
+# Normalize without doublets.
+```{r}
+normalize_and_cluster = function(input_object) {
+  no_doublets = subset(input_object, subset = DoubletFinder == "Singlet")
+  DefaultAssay(no_doublets) = "RNA"
+  no_doublets[["SCT"]] = NULL
+  
+  normalized_seu = SCTransform(no_doublets, vars.to.regress = "percent.mt", verbose = FALSE)
+  normalized_seu = RunPCA(normalized_seu)
+  normalized_seu = RunUMAP(normalized_seu, dims = 1:10)
+  return(normalized_seu)
+}
+```
+
+```{r}
+normalized_seurat = normalize_and_cluster(merged_seurat)
+saveRDS(normalized_seurat, "rds_objects/12685-JVA/2_normalized_seurat.rds")
+```
+
+# Harmonize.
+```{r}
+DimPlot(normalized_seurat, group.by = "sample")
+harmonized_seurat = RunHarmony(normalized_seurat, group.by = "sample")
+
+harmonized_seurat = harmonized_seurat %>%
+  RunUMAP(reduction = "harmony", dims = 1:10) %>% 
+  FindNeighbors(reduction = "harmony", dims = 1:10) %>% 
+  FindClusters(resolution = 0.5)
+
+(chs_clustered_umap = DimPlot(harmonized_seurat, group.by = "seurat_clusters"))
+save_plot(chs_clustered_umap, "figures/12685-JVA/chs_clustered_umap", png = TRUE, height = 5, width = 6)
+
+saveRDS(harmonized_seurat, "rds_objects/12685-JVA/3_harmonized_seurat.rds")
+
+```
+```{r}
+harmonized_seurat = readRDS("rds_objects/12685-JVA/3_harmonized_seurat.rds")
+set.seed(1234)
+harmonized_subset = harmonized_seurat[, sample(colnames(harmonized_seurat), size = 10000, replace=F)]
+
+```
+
+# There were several very distinct clusters that scType didn't have enough resolution to capture, so trying other methods.
+# Annotated by projecting annotations from Tabula Sapiens Blood:
+```{r}
+system("wget https://datasets.cellxgene.cziscience.com/582149d8-2a8f-44cf-9605-337b8ca8d518.rds") # rename as tabula_sapiens_blood.rds
+tabula_sapiens_blood = readRDS("input_data/tabula_sapiens_blood.rds")
+```
+# Convert gene names for tabula sapiens.
+```{r}
+tabula_mapped_ensembls = mapIds(
+  org.Hs.eg.db,
+  keys = rownames(tabula_sapiens_blood),
+  column = 'SYMBOL',
+  keytype = 'ENSEMBL')
+
+# Seurat objects cannot handle renaming rownames but SingleCellExperiment objects can, so converting back and forth manages the issue.
+tabula_sce = as.SingleCellExperiment(tabula_sapiens_blood)
+rownames(tabula_sce) = tabula_mapped_ensembls
+tabula_sce = tabula_sce[!is.na(rownames(tabula_sce)),]
+rownames(tabula_sce) = make.unique(rownames(tabula_sce)) 
+tabula_symbols_blood = as.Seurat(tabula_sce)
+```
+
+# Project annotations.
+```{r}
+tabula_symbols_blood = SCTransform(tabula_symbols_blood)
+tabula_symbols_blood = RunPCA(tabula_symbols_blood)
+
+pbmc.anchors = FindTransferAnchors(reference = tabula_symbols_blood, query = harmonized_seurat, dims = 1:30,
+    reference.reduction = "pca")
+predictions = TransferData(anchorset = pbmc.anchors, refdata = tabula_symbols_blood$cell_type, dims = 1:30)
+annotated_seurat = AddMetaData(harmonized_seurat, metadata = predictions)
+saveRDS(annotated_seurat, "rds_objects/12685-JVA/4_annotated_seurat.rds")
+saveRDS(tabula_symbols_blood, "rds_objects/tabula_symbols_blood.rds")
+
+write_tsv(annotated_seurat@meta.data, "tables/12685_annotated_with_tabula.tsv")
+```
+
+
+
+# Hm not actually any better than scType - seems a little worse actually. 
+```{r}
+
+DimPlot(annotated_seurat, group.by = "predicted.id")
+
+```
+
+
+
+# Prep for scType.
+```{r}
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+
+# DB file
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue = "Immune system" # e.g. Immune system, Pancreas, Liver, Eye, Kidney, Brain, Lung, Adrenal, Heart, Intestine, Muscle, Placenta, Spleen, Stomach, Thymus 
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+```
+
+# Annotate cell types.
+```{r}
+annotate_with_scType = function(seu_object) {
+  # get cell-type by cell matrix
+  es.max = sctype_score(scRNAseqData = seu_object[["SCT"]]@data, scaled = TRUE, 
+                        gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+  
+  
+  # merge by cluster
+  cL_results = do.call("rbind", lapply(unique(seu_object@meta.data$seurat_clusters), function(cl){
+      es.max.cl = sort(rowSums(es.max[ ,rownames(seu_object@meta.data[seu_object@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+      head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seu_object@meta.data$seurat_clusters==cl)), 10)
+  }))
+  
+  top_5_sctype_scores = cL_results %>% dplyr::group_by(cluster) %>% dplyr::top_n(n = 5, wt = scores)  
+  sctype_scores = cL_results %>% dplyr::group_by(cluster) %>% dplyr::top_n(n = 1, wt = scores)  
+  
+  # set low-confident (low ScType score) clusters to "unknown"
+  sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+  
+  seu_object@meta.data$customclassif = ""
+  for (j in unique(sctype_scores$cluster)){
+    cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+    seu_object@meta.data$customclassif[seu_object@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+  }
+  return(seu_object)
+}
+
+
+sctype_annotated_subset = annotate_with_scType(harmonized_subset)
+
+```
+
+```{r}
+DimPlot(sctype_annotated_subset, group.by = "customclassif")
+```
+
+```{r}
+DimPlot(sctype_annotated_subset)
+```
+
+
+# Check for signs of dead/dying cells.
+```{r}
+VlnPlot(sctype_annotated_subset, features = c("percent.mt", "nCount_RNA", "nFeature_RNA"), group.by = "seurat_clusters")
+```
+
+# Remove cluster 11 for high mito and cluster 18 for low counts.
+```{r}
+annotated_seurat = subset(harmonized_seurat, subset = seurat_clusters != 11 & seurat_clusters != 18)
+```
+
+
+```{r}
+table(sctype_annotated_subset$customclassif, sctype_annotated_subset$seurat_clusters)
+```
+
+```{r}
+cluster_labels = sctype_annotated_subset@meta.data %>%
+  dplyr::select(seurat_clusters, customclassif) %>%
+  unique()
+
+temp_metadata = annotated_seurat@meta.data %>%
+  rownames_to_column()
+temp_metadata = left_join(temp_metadata, cluster_labels, by = "seurat_clusters") %>%
+  column_to_rownames() %>%
+  dplyr::rename(cell_type = "customclassif")
+
+annotated_seurat@meta.data = temp_metadata
+saveRDS(annotated_seurat, "rds_objects/12685-JVA/4_annotated_seurat.rds")
+```
+
+
+```{r}
+(chs_mca_labeled_umap = DimPlot(annotated_seurat, group.by = "cell_type") + ggtitle("CHS mCA scRNAseq"))
+save_plot(chs_mca_labeled_umap, "figures/12685-JVA/chs_mca_labeled_umap", height = 5, width = 7, png = TRUE)
+```
+
+```{r}
+chs_data = annotated_seurat@meta.data %>%
+  mutate(sample = factor(sample, levels = c('4', '5', '6', '7', '8', '9', '10')))
+(cell_type_bar = ggplot(chs_data, aes(x = sample, fill = cell_type)) +
+  geom_bar(position = "fill") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  ylab("Proportion") +
+  xlab("Sample") +
+  guides(fill = guide_legend("")) +
+  ggtitle("Cell-type proportions per sample"))
+save_plot(cell_type_bar, "figures/12685-JVA/cell_type_bar", height = 5, width = 7, png = TRUE)
+
+```
+
